@@ -1,0 +1,16 @@
+{
+  "name": "watch-video",
+  "owner": {
+    "name": "webdevbar"
+  },
+  "metadata": {
+    "description": "watch-video - caption-first video/SNS context with CUDA Whisper, metadata, deduped key frames, and OCR. Local-first."
+  },
+  "plugins": [
+    {
+      "name": "watch-video",
+      "source": "./",
+      "description": "Caption-first video/SNS inspection with CUDA Whisper + frames + OCR (local-first)."
+    }
+  ]
+}

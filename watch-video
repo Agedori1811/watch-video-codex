@@ -1,0 +1,996 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.10"
+# dependencies = [
+#   "faster-whisper>=1.1.0",
+#   "yt-dlp[default,curl-cffi]>=2026.8.6",
+#   "Pillow>=10.0",
+#   "numpy>=1.24",
+#   "pytesseract>=0.3.10",
+# ]
+# ///
+"""
+watch-video — turn a video (Loom / URL / local file) into something an LLM can read:
+a timestamped transcript + a deduplicated set of key frames (+ optional OCR of
+on-screen text). Built so a CLI coding agent (Claude Code, etc.) can "watch" a
+client's screen-recording and decipher it.
+
+Everything runs LOCALLY (yt-dlp + ffmpeg + faster-whisper + tesseract). No video or
+audio is sent to a cloud service — important when the recording contains private /
+financial data. The only thing that leaves your machine is whatever you (or your
+agent) later choose to read out of the output folder.
+
+Usage:
+    watch-video <loom-url | any-url | local-file> [options]
+
+Common options:
+    --out DIR                 output folder (default: ./watch-video-out/<slug>)
+    --model NAME              whisper model or auto (medium on CUDA, small on CPU)
+    --periodic SECONDS        sample a frame every N seconds (default: 4)
+    --scene-threshold FLOAT   extra frame on scene change, 0..1 (default: 0.08)
+    --max-frames N            cap kept frames (default: 200)
+    --dedupe-distance N       perceptual-hash hamming distance to treat frames as dupes (default: 6)
+    --no-ocr                  skip the tesseract OCR pass
+    --no-contact-sheet        skip the montage overview image
+    --cookies-from-browser B  pass private/team Loom auth via browser cookies (firefox|chrome|...)
+    --cookies FILE            pass a Netscape cookies.txt for yt-dlp
+    --language LANG           force transcription language (e.g. en); default = auto-detect
+
+Output folder contains: SUMMARY.md (read this first), transcript.md, transcript.txt,
+frames/*.jpg, frames/ocr/*.txt (if OCR), contact-sheet.jpg.
+"""
+
+import argparse
+import html
+import os
+import re
+import shutil
+import subprocess
+import sys
+from functools import lru_cache
+from datetime import datetime
+from pathlib import Path
+import json
+from datetime import datetime, timezone, timedelta
+
+WATCH_VIDEO_VERSION = "1.2.0"
+
+
+def write_manifest(out_dir, source, downloaded_name=None):
+    """Write the hidden ownership marker every cleanup operation validates.
+    Preserves an existing valid manifest's `created` so re-runs don't reset run age.
+    Records `downloaded_source` (the basename watch-video downloaded) so cleanup deletes
+    only OUR source file, never a user's pre-existing source.*."""
+    mf = out_dir / ".watch-video.json"
+    created = None
+    if mf.is_file():
+        try:
+            old = json.loads(mf.read_text())
+            if old.get("tool") == "watch-video":
+                created = old.get("created")
+        except Exception:
+            created = None
+    manifest = {
+        "tool": "watch-video",
+        "version": WATCH_VIDEO_VERSION,
+        "source": str(source),
+        "downloaded_source": downloaded_name,
+        "created": created or datetime.now(timezone.utc).isoformat(),
+    }
+    mf.write_text(json.dumps(manifest, indent=2) + "\n")
+
+
+def is_watch_video_dir(path):
+    """True only if path holds a .watch-video.json whose SIGNATURE validates — not mere
+    filename presence. The single ownership gate used by reconciliation AND cleanup."""
+    mf = Path(path) / ".watch-video.json"
+    if not mf.is_file():
+        return False
+    try:
+        return json.loads(mf.read_text()).get("tool") == "watch-video"
+    except Exception:
+        return False
+
+
+def eprint(*a):
+    print(*a, file=sys.stderr, flush=True)
+
+
+def run(cmd, **kw):
+    return subprocess.run(cmd, check=True, **kw)
+
+
+def have(binary):
+    return shutil.which(binary) is not None
+
+
+@lru_cache(maxsize=1)
+def fps_mode_args():
+    """Ask this ffmpeg which frame-rate flag it takes, rather than guessing from a version string.
+
+    ffmpeg 9 REMOVED `-vsync` ("Unrecognized option 'vsync'"), and `-fps_mode` only arrived in
+    5.1 - so neither flag alone covers the builds in the wild, and distro version strings
+    ("n5.1.2", "4.4.2-0ubuntu0.22.04.1") are not worth parsing. One throwaway encode of a null
+    source settles it.
+    """
+    probe = subprocess.run(
+        ["ffmpeg", "-hide_banner", "-loglevel", "error",
+         "-f", "lavfi", "-i", "nullsrc=s=16x16:d=0.04",
+         "-fps_mode", "vfr", "-f", "null", "-"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    return ["-fps_mode", "vfr"] if probe.returncode == 0 else ["-vsync", "vfr"]
+
+
+def slugify(text):
+    text = re.sub(r"^https?://", "", text)
+    text = re.sub(r"[^a-zA-Z0-9._-]+", "-", text).strip("-")
+    return (text[:60] or "video").lower()
+
+
+def hms(seconds):
+    seconds = int(seconds)
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h:d}:{m:02d}:{s:02d}" if h else f"{m:d}:{s:02d}"
+
+
+# ---------------------------------------------------------------------------
+# 1. acquire the video (local file passthrough, else yt-dlp)
+# ---------------------------------------------------------------------------
+def acquire(source, out_dir, cookies_from_browser, cookies_file):
+    local = Path(source).expanduser()
+    if local.exists() and local.is_file():
+        eprint(f"[acquire] local file: {local}")
+        return local, False
+
+    if not have("yt-dlp"):
+        sys.exit("ERROR: yt-dlp not found. Install with: uv tool install yt-dlp")
+
+    target = out_dir / "source.%(ext)s"
+    cmd = [
+        "yt-dlp",
+        "--no-playlist",
+        "-f", "bv*+ba/b",            # best video+audio, merged by ffmpeg
+        "--merge-output-format", "mp4",
+        "-o", str(target),
+    ]
+    if cookies_from_browser:
+        cmd += ["--cookies-from-browser", cookies_from_browser]
+    if cookies_file:
+        cmd += ["--cookies", str(Path(cookies_file).expanduser())]
+    cmd.append(source)
+    eprint(f"[acquire] downloading via yt-dlp: {source}")
+    run(cmd)
+    mp4s = sorted(out_dir.glob("source.*"))
+    if not mp4s:
+        sys.exit("ERROR: yt-dlp produced no file (private link needs --cookies-from-browser?).")
+    return mp4s[0], True
+
+
+def _auth_args(cookies_from_browser, cookies_file):
+    args = []
+    # yt-dlp enables Deno automatically, but other installed runtimes must be named.
+    # This keeps current YouTube extraction working on machines that have Node but not Deno.
+    if not have("deno"):
+        for runtime, binary in (("node", "node"), ("bun", "bun"), ("quickjs", "qjs")):
+            path = shutil.which(binary)
+            if path:
+                args += ["--js-runtimes", f"{runtime}:{path}"]
+                break
+    if cookies_from_browser:
+        args += ["--cookies-from-browser", cookies_from_browser]
+    if cookies_file:
+        args += ["--cookies", str(Path(cookies_file).expanduser())]
+    return args
+
+
+def probe_source(source, cookies_from_browser=None, cookies_file=None):
+    """Fetch public post/video metadata before the media download.
+
+    This is deliberately best-effort: an extractor may allow the media download even
+    when its JSON probe is incomplete. Only a small, stable subset is persisted so the
+    output does not inherit yt-dlp's cookies, request headers, or volatile internals.
+    """
+    local = Path(source).expanduser()
+    if local.exists() and local.is_file():
+        stat = local.stat()
+        return {
+            "extractor": "local-file",
+            "title": local.name,
+            "webpage_url": None,
+            "duration": duration_seconds(local),
+            "filesize": stat.st_size,
+        }
+    if not have("yt-dlp"):
+        return {}
+    cmd = ["yt-dlp", "--no-playlist", "--skip-download", "--dump-single-json"]
+    cmd += _auth_args(cookies_from_browser, cookies_file)
+    cmd.append(source)
+    eprint(f"[metadata] probing source via yt-dlp: {source}")
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if proc.returncode != 0:
+        tail = (proc.stderr or "").strip().splitlines()
+        eprint(f"[metadata] WARNING: probe failed: {tail[-1] if tail else 'unknown error'}")
+        return {}
+    try:
+        return json.loads(proc.stdout)
+    except Exception as exc:
+        eprint(f"[metadata] WARNING: could not parse yt-dlp metadata: {exc}")
+        return {}
+
+
+METADATA_KEYS = (
+    "id", "title", "description", "extractor", "extractor_key", "webpage_url",
+    "original_url", "uploader", "uploader_id", "channel", "channel_id", "creator",
+    "duration", "timestamp", "release_timestamp", "upload_date", "live_status",
+    "view_count", "like_count", "repost_count", "comment_count", "language",
+    "availability", "age_limit", "categories", "tags", "chapters", "filesize",
+)
+
+
+def write_metadata(out_dir, info, source):
+    """Write sanitized SNS/video context for the agent; never persist raw extractor JSON."""
+    clean = {k: info.get(k) for k in METADATA_KEYS if info.get(k) is not None}
+    clean["source_input"] = str(source)
+    (out_dir / "metadata.json").write_text(
+        json.dumps(clean, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
+    lines = ["# Source metadata", ""]
+    labels = (
+        ("title", "Title"), ("extractor", "Platform / extractor"),
+        ("uploader", "Uploader"), ("channel", "Channel"), ("creator", "Creator"),
+        ("webpage_url", "Canonical URL"), ("upload_date", "Upload date"),
+        ("duration", "Duration (seconds)"), ("view_count", "Views"),
+        ("like_count", "Likes"), ("repost_count", "Reposts"),
+        ("comment_count", "Comments"), ("language", "Declared language"),
+    )
+    for key, label in labels:
+        if clean.get(key) is not None:
+            lines.append(f"- **{label}:** {clean[key]}")
+    if clean.get("description"):
+        lines += ["", "## Description / post text", "", str(clean["description"]).strip()]
+    chapters = clean.get("chapters") or []
+    if chapters:
+        lines += ["", "## Chapters", ""]
+        for chapter in chapters:
+            lines.append(f"- **[{hms(chapter.get('start_time', 0))}]** {chapter.get('title', '')}")
+    (out_dir / "metadata.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return clean
+
+
+def _lang_matches(key, preferred):
+    key_l = (key or "").lower().replace("_", "-")
+    pref_l = (preferred or "").lower().replace("_", "-")
+    return key_l == pref_l or key_l.startswith(pref_l + "-") or pref_l.startswith(key_l + "-")
+
+
+def choose_caption(info, preferred_language=None):
+    """Return (kind, language) with authored captions preferred over automatic ones."""
+    manual = info.get("subtitles") or {}
+    automatic = info.get("automatic_captions") or {}
+    declared = info.get("language")
+    preferences = []
+    if preferred_language and preferred_language != "auto":
+        preferences.append(preferred_language)
+    elif declared:
+        preferences.append(declared)
+    preferences += ["ja", "en"]
+
+    for pool_name, pool in (("manual-caption", manual), ("auto-caption", automatic)):
+        for pref in preferences:
+            for key in pool:
+                if _lang_matches(key, pref):
+                    return pool_name, key
+        if pool and not (preferred_language and preferred_language != "auto"):
+            return pool_name, sorted(pool)[0]
+    return None, None
+
+
+def download_caption(source, out_dir, info, preferred_language, cookies_from_browser, cookies_file):
+    kind, language = choose_caption(info, preferred_language)
+    if not kind:
+        return None
+    captions_dir = out_dir / "captions"
+    captions_dir.mkdir(exist_ok=True)
+    cmd = [
+        "yt-dlp", "--no-playlist", "--skip-download",
+        "--write-subs" if kind == "manual-caption" else "--write-auto-subs",
+        "--sub-langs", language, "--sub-format", "vtt/best", "--convert-subs", "vtt",
+        "-o", str(captions_dir / "source"),
+    ]
+    cmd += _auth_args(cookies_from_browser, cookies_file)
+    cmd.append(source)
+    eprint(f"[captions] trying {kind} language '{language}' before Whisper…")
+    proc = subprocess.run(cmd)
+    candidates = sorted(captions_dir.glob("source*.vtt"))
+    if proc.returncode == 0 and candidates:
+        return {"path": candidates[0], "kind": kind, "language": language}
+    eprint("[captions] selected caption could not be downloaded; Whisper will be used if enabled.")
+    return None
+
+
+def find_local_caption(source, explicit=None, preferred_language=None):
+    video = Path(source).expanduser()
+    candidates = []
+    if explicit:
+        candidates = [Path(explicit).expanduser()]
+    elif video.exists() and video.is_file():
+        if preferred_language and preferred_language != "auto":
+            candidates += [video.with_suffix(f".{preferred_language}.vtt"),
+                           video.with_suffix(f".{preferred_language}.srt")]
+        candidates += [video.with_suffix(".vtt"), video.with_suffix(".srt")]
+        candidates += sorted(video.parent.glob(video.stem + ".*.vtt"))
+        candidates += sorted(video.parent.glob(video.stem + ".*.srt"))
+    for candidate in candidates:
+        if candidate.is_file():
+            return {"path": candidate, "kind": "sidecar-caption",
+                    "language": preferred_language if preferred_language != "auto" else "unknown"}
+    if explicit:
+        sys.exit(f"ERROR: caption file not found: {explicit}")
+    return None
+
+
+def _timestamp_seconds(value):
+    parts = value.strip().replace(",", ".").split(":")
+    try:
+        if len(parts) == 3:
+            return int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
+        if len(parts) == 2:
+            return int(parts[0]) * 60 + float(parts[1])
+    except ValueError:
+        pass
+    raise ValueError(f"invalid caption timestamp: {value}")
+
+
+def parse_caption(path):
+    """Parse ordinary WebVTT/SRT cues into (start_seconds, text) pairs."""
+    raw = Path(path).read_text(encoding="utf-8-sig", errors="replace")
+    lines = raw.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    raw_segments, i = [], 0
+    timing = re.compile(r"^\s*([^ ]+)\s+-->\s+([^ ]+)")
+    while i < len(lines):
+        match = timing.match(lines[i])
+        if not match:
+            i += 1
+            continue
+        try:
+            start = _timestamp_seconds(match.group(1))
+        except ValueError:
+            i += 1
+            continue
+        i += 1
+        cue = []
+        while i < len(lines) and lines[i].strip():
+            cue.append(lines[i].strip())
+            i += 1
+        text = " ".join(cue)
+        rolling = bool(re.search(r"<\d{1,2}:\d{2}(?::\d{2})?\.\d+>", text))
+        text = html.unescape(re.sub(r"<[^>]+>", "", text))
+        text = re.sub(r"\s+", " ", text).strip()
+        if text:
+            raw_segments.append((start, text, rolling))
+
+    # YouTube's automatic WebVTT often emits karaoke-style rolling cues: each cue repeats
+    # and extends the previous text. Collapse only cues carrying inline word timestamps;
+    # ordinary authored VTT/SRT remains untouched.
+    segments = []
+    for start, text, rolling in raw_segments:
+        if not segments:
+            segments.append((start, text))
+            continue
+        prev_start, previous = segments[-1]
+        if text == previous:
+            continue
+        if rolling and start - prev_start <= 8:
+            if text.startswith(previous):
+                segments[-1] = (prev_start, text)
+                continue
+            if previous.startswith(text):
+                continue
+            max_overlap = min(len(previous), len(text))
+            overlap = next((n for n in range(max_overlap, 1, -1)
+                            if previous[-n:] == text[:n]), 0)
+            if overlap:
+                text = text[overlap:].lstrip()
+                if not text:
+                    continue
+        segments.append((start, text))
+    return segments
+
+
+def write_caption_transcript(out_dir, caption):
+    source_path = Path(caption["path"])
+    captions_dir = out_dir / "captions"
+    captions_dir.mkdir(exist_ok=True)
+    if source_path.parent.resolve() != captions_dir.resolve():
+        copied = captions_dir / ("source" + source_path.suffix.lower())
+        shutil.copy2(source_path, copied)
+        source_path = copied
+    segments = parse_caption(source_path)
+    if not segments:
+        eprint(f"[captions] WARNING: no usable cues in {source_path}; falling back to Whisper.")
+        return None
+    title = f"Caption transcript ({caption['kind']}, lang={caption['language']})"
+    md = [f"# {title}", ""] + [f"- **[{hms(start)}]** {text}" for start, text in segments]
+    (out_dir / "transcript.md").write_text("\n".join(md) + "\n", encoding="utf-8")
+    (out_dir / "transcript.txt").write_text(
+        "\n".join(text for _, text in segments) + "\n", encoding="utf-8"
+    )
+    return segments
+
+
+# ---------------------------------------------------------------------------
+# 2. probe duration
+# ---------------------------------------------------------------------------
+def duration_seconds(video):
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=nw=1:nk=1", str(video)],
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        return float(out)
+    except Exception:
+        return 0.0
+
+
+# ---------------------------------------------------------------------------
+# 3. extract frames: first + periodic + scene-change, then perceptual dedupe
+# ---------------------------------------------------------------------------
+def extract_frames(video, frames_dir, periodic, scene_threshold):
+    frames_dir.mkdir(parents=True, exist_ok=True)
+    select = (
+        f"select='eq(n\\,0)+gt(scene\\,{scene_threshold})+not(mod(t\\,{periodic}))',"
+        "showinfo"
+    )
+    info_log = frames_dir / "_showinfo.txt"
+    with open(info_log, "w") as log:
+        subprocess.run(
+            ["ffmpeg", "-hide_banner", "-loglevel", "info", "-i", str(video),
+             "-vf", select, *fps_mode_args(), "-q:v", "2",
+             str(frames_dir / "%06d.jpg")],
+            check=True, stderr=log,
+        )
+    # map each emitted frame (in order) to its pts_time from showinfo
+    times = [float(m) for m in re.findall(r"pts_time:([0-9.]+)", info_log.read_text())]
+    info_log.unlink(missing_ok=True)
+    frames = sorted(frames_dir.glob("[0-9]*.jpg"))
+    if len(times) != len(frames):
+        eprint(f"[frames] WARNING: showinfo emitted {len(times)} timestamps for {len(frames)} frames; extra frames get t=0.0")
+    return list(zip(frames, times + [0.0] * (len(frames) - len(times))))
+
+
+def dhash(path, size=8):
+    from PIL import Image
+    import numpy as np
+    img = Image.open(path).convert("L").resize((size + 1, size), Image.LANCZOS)
+    arr = np.asarray(img, dtype=np.int16)
+    diff = arr[:, 1:] > arr[:, :-1]
+    bits = 0
+    for b in diff.flatten():
+        bits = (bits << 1) | int(b)
+    return bits
+
+
+def hamming(a, b):
+    return bin(a ^ b).count("1")
+
+
+def dedupe(frame_times, distance, max_frames):
+    kept, last_hash = [], None
+    for path, t in frame_times:
+        h = dhash(path)
+        if last_hash is not None and hamming(h, last_hash) < distance:
+            path.unlink(missing_ok=True)      # drop near-duplicate
+            continue
+        kept.append((path, t))
+        last_hash = h
+    # enforce cap by uniform thinning (keep first/last, sample the middle)
+    if len(kept) > max_frames:
+        if max_frames <= 1:
+            idx = [0]
+        else:
+            idx = sorted({round(i * (len(kept) - 1) / (max_frames - 1)) for i in range(max_frames)})
+        keepset = {kept[i][0] for i in idx}
+        for path, _ in kept:
+            if path not in keepset:
+                path.unlink(missing_ok=True)
+        kept = [(p, t) for p, t in kept if p in keepset]
+    # renumber kept frames sequentially with their timestamp baked into the name
+    renamed = []
+    for i, (path, t) in enumerate(kept):
+        new = path.with_name(f"frame_{i:03d}_{hms(t).replace(':', 'm')}s.jpg")
+        path.rename(new)
+        renamed.append((new, t))
+    return renamed
+
+
+# ---------------------------------------------------------------------------
+# 4. transcribe with faster-whisper (local, CUDA when available)
+# ---------------------------------------------------------------------------
+def resolve_whisper_backend(device="auto", compute_type="auto"):
+    requested = device
+    if device == "auto":
+        try:
+            import ctranslate2
+            device = "cuda" if ctranslate2.get_cuda_device_count() > 0 else "cpu"
+        except Exception:
+            device = "cpu"
+    if compute_type == "auto":
+        compute_type = "float16" if device == "cuda" else "int8"
+    return requested, device, compute_type
+
+
+def transcribe(video, out_dir, model_name, language, device="auto", compute_type="auto"):
+    from faster_whisper import WhisperModel
+    requested, actual_device, actual_compute = resolve_whisper_backend(device, compute_type)
+    requested_model = model_name
+    actual_model = ("medium" if actual_device == "cuda" else "small") if model_name == "auto" else model_name
+    eprint(
+        f"[transcribe] loading whisper '{actual_model}' "
+        f"({actual_device}/{actual_compute}; first run downloads the model)…"
+    )
+    try:
+        model = WhisperModel(actual_model, device=actual_device, compute_type=actual_compute)
+        segment_iter, info = model.transcribe(str(video), language=language, vad_filter=True)
+        raw_segments = list(segment_iter)  # CUDA/runtime failures can surface lazily here.
+    except Exception as exc:
+        if requested == "auto" and actual_device == "cuda":
+            eprint(f"[transcribe] WARNING: CUDA failed ({exc}); retrying on CPU/int8.")
+            actual_device, actual_compute = "cpu", "int8"
+            if requested_model == "auto":
+                actual_model = "small"
+            model = WhisperModel(actual_model, device=actual_device, compute_type=actual_compute)
+            segment_iter, info = model.transcribe(str(video), language=language, vad_filter=True)
+            raw_segments = list(segment_iter)
+        else:
+            raise
+    md, txt, segments_out = [], [], []
+    for seg in raw_segments:
+        stamp = hms(seg.start)
+        line = seg.text.strip()
+        md.append(f"- **[{stamp}]** {line}")
+        txt.append(line)
+        segments_out.append((seg.start, line))
+    (out_dir / "transcript.md").write_text(
+        f"# Transcript ({actual_model}, lang={info.language})\n\n" + "\n".join(md) + "\n"
+    )
+    (out_dir / "transcript.txt").write_text("\n".join(txt) + "\n")
+    return info.language, segments_out, actual_device, actual_compute, actual_model
+
+
+def diagnose():
+    """Print a concise local readiness report without downloading a video or model."""
+    print(f"watch-video {WATCH_VIDEO_VERSION}")
+    for binary in ("ffmpeg", "ffprobe", "yt-dlp", "tesseract"):
+        print(f"{binary}: {'present' if have(binary) else 'missing'}")
+    js_runtime = next((name for name in ("deno", "node", "bun", "qjs") if have(name)), None)
+    print(f"javascript_runtime: {js_runtime or 'missing (recommended for full YouTube support)'}")
+    try:
+        import ctranslate2
+        count = ctranslate2.get_cuda_device_count()
+        print(f"ctranslate2: {getattr(ctranslate2, '__version__', 'present')}")
+        print(f"cuda_devices: {count}")
+        print(f"recommended_backend: {'cuda/float16' if count else 'cpu/int8'}")
+    except Exception as exc:
+        print(f"ctranslate2: unavailable ({exc})")
+        print("cuda_devices: 0")
+        print("recommended_backend: cpu/int8")
+
+
+def _prep_for_ocr(img):
+    """Upscale + grayscale + threshold a frame for sharper on-screen-text OCR."""
+    from PIL import Image
+    import numpy as np
+    if img.width < 1000:
+        scale = 1000 / img.width
+        img = img.resize((int(img.width * scale), int(img.height * scale)), Image.LANCZOS)
+    gray = np.asarray(img.convert("L"))
+    thresh = gray.mean()
+    bw = (gray > thresh).astype("uint8") * 255
+    return Image.fromarray(bw)
+
+
+# ---------------------------------------------------------------------------
+# 5. OCR each kept frame (optional; financial numbers shown on screen)
+# ---------------------------------------------------------------------------
+def ocr_frames(frames, frames_dir, tuned=False):
+    import pytesseract
+    from PIL import Image
+    ocr_dir = frames_dir / "ocr"
+    ocr_dir.mkdir(exist_ok=True)
+    combined = []
+    ocr_map = {}
+    for path, t in frames:
+        im = Image.open(path)
+        if tuned:
+            im = _prep_for_ocr(im)
+            text = pytesseract.image_to_string(im, config="--psm 6").strip()
+        else:
+            text = pytesseract.image_to_string(im).strip()
+        ocr_map[path] = text
+        (ocr_dir / (path.stem + ".txt")).write_text(text)
+        if text:
+            combined.append(f"### {path.name} (@ {hms(t)})\n{text}\n")
+    (frames_dir / "ocr-combined.md").write_text("\n".join(combined) + "\n")
+    return ocr_map
+
+
+# ---------------------------------------------------------------------------
+# 6. contact sheet montage (overview)
+# ---------------------------------------------------------------------------
+def contact_sheet(frames, out_path, cols=4, thumb_w=480):
+    from PIL import Image, ImageDraw
+    if not frames:
+        return None
+    thumbs = []
+    for path, t in frames:
+        im = Image.open(path).convert("RGB")
+        ratio = thumb_w / im.width
+        im = im.resize((thumb_w, int(im.height * ratio)))
+        d = ImageDraw.Draw(im)
+        label = hms(t)
+        d.rectangle([0, 0, 8 + 8 * len(label), 18], fill=(0, 0, 0))
+        d.text((4, 3), label, fill=(255, 255, 255))
+        thumbs.append(im)
+    rows = (len(thumbs) + cols - 1) // cols
+    cell_h = max(t.height for t in thumbs)
+    sheet = Image.new("RGB", (cols * thumb_w, rows * cell_h), (20, 20, 20))
+    for i, im in enumerate(thumbs):
+        sheet.paste(im, ((i % cols) * thumb_w, (i // cols) * cell_h))
+    sheet.save(out_path, quality=85)
+    return out_path
+
+
+def write_timeline(out_dir, kept, segments, ocr_map):
+    """Chronological merge of frames + transcript + OCR. Tolerates missing inputs."""
+    lines = ["# Timeline\n"]
+    n = len(kept)
+    for i, (path, t) in enumerate(kept):
+        next_t = kept[i + 1][1] if i + 1 < n else float("inf")
+        lines.append(f"## {hms(t)}")
+        lines.append(f"![frame](frames/{path.name})")
+        for s, said in segments:
+            if t <= s < next_t:
+                lines.append(f"> {said}")
+        snippet = " ".join((ocr_map.get(path, "") or "").split())[:200]
+        if snippet:
+            lines.append(f"OCR: {snippet}")
+        lines.append("")
+    (out_dir / "timeline.md").write_text("\n".join(lines) + "\n")
+
+
+def reconcile_stale(out_dir, frames_dir, dir_was_ours, do_transcribe, do_timeline, do_contact):
+    """Remove prior watch-video artifacts this run will NOT (re)produce, so SUMMARY stays accurate.
+    Acts ONLY when the folder was already a watch-video output before this run (dir_was_ours) --
+    so it never touches a user's pre-existing non-watch-video folder."""
+    if not dir_was_ours:
+        return
+    (out_dir / "metadata.md").unlink(missing_ok=True)
+    (out_dir / "metadata.json").unlink(missing_ok=True)
+    captions_dir = out_dir / "captions"
+    if captions_dir.exists():
+        for f in captions_dir.glob("source*"):
+            if f.is_file():
+                f.unlink(missing_ok=True)
+    if not do_transcribe:
+        (out_dir / "transcript.md").unlink(missing_ok=True)
+        (out_dir / "transcript.txt").unlink(missing_ok=True)
+    if not do_timeline:
+        (out_dir / "timeline.md").unlink(missing_ok=True)
+    if not do_contact:
+        (out_dir / "contact-sheet.jpg").unlink(missing_ok=True)
+    # OCR outputs are stale every re-run (frames are re-extracted) -- always clear them; they are
+    # regenerated this run if OCR runs. This also fixes lingering per-frame files when OCR stays on.
+    (frames_dir / "ocr-combined.md").unlink(missing_ok=True)
+    ocr_dir = frames_dir / "ocr"
+    if ocr_dir.exists():
+        for f in ocr_dir.glob("*.txt"):
+            f.unlink(missing_ok=True)
+    # frames are always re-extracted fresh -- clear watch-video's OWN frame-name patterns only
+    # (extraction temps "NNNNNN.jpg" + deduped "frame_*.jpg"), never a user's unrelated .jpg.
+    if frames_dir.exists():
+        for pattern in ("frame_*.jpg", "[0-9][0-9][0-9][0-9][0-9][0-9].jpg"):
+            for f in frames_dir.glob(pattern):
+                f.unlink(missing_ok=True)
+
+
+def manifest_created(path):
+    try:
+        data = json.loads((Path(path) / ".watch-video.json").read_text())
+        return datetime.fromisoformat(data["created"])
+    except Exception:
+        return None
+
+
+def _looks_like_path(arg):
+    return ("/" in arg) or ("\\" in arg) or Path(arg).is_absolute()
+
+
+# The exact set of files/dirs watch-video creates in an output folder.
+WV_ARTIFACT_NAMES = ("SUMMARY.md", "transcript.md", "transcript.txt", "timeline.md",
+                     "contact-sheet.jpg", "metadata.md", "metadata.json", ".watch-video.json")
+
+
+def remove_wv_artifacts(d):
+    """Delete ONLY watch-video's own artifacts in d, then rmdir d if it is now empty.
+    Never blanket-deletes the folder: if the user pointed --out at a folder containing
+    their own files, those survive and the folder is left in place."""
+    d = Path(d)
+    downloaded = None
+    try:
+        m = json.loads((d / ".watch-video.json").read_text())
+        if m.get("tool") == "watch-video":
+            downloaded = m.get("downloaded_source")
+    except Exception:
+        downloaded = None
+    for name in WV_ARTIFACT_NAMES:
+        (d / name).unlink(missing_ok=True)
+    if downloaded:
+        cand = d / Path(downloaded).name           # basename only — never escape d via ../ or abs path
+        if cand.parent.resolve() == d.resolve():
+            cand.unlink(missing_ok=True)
+    frames = d / "frames"
+    if frames.exists():
+        (frames / "ocr-combined.md").unlink(missing_ok=True)
+        (frames / "_showinfo.txt").unlink(missing_ok=True)
+        ocr_dir = frames / "ocr"
+        if ocr_dir.exists():
+            for f in ocr_dir.glob("*.txt"):
+                f.unlink(missing_ok=True)
+            try:
+                ocr_dir.rmdir()
+            except OSError:
+                pass
+        for pattern in ("frame_*.jpg", "[0-9][0-9][0-9][0-9][0-9][0-9].jpg"):
+            for f in frames.glob(pattern):
+                f.unlink(missing_ok=True)
+        try:
+            frames.rmdir()   # remove frames/ only if now empty — user's own files survive
+        except OSError:
+            pass
+    captions = d / "captions"
+    if captions.exists():
+        for f in captions.glob("source*"):
+            if f.is_file():
+                f.unlink(missing_ok=True)
+        try:
+            captions.rmdir()
+        except OSError:
+            pass
+    try:
+        d.rmdir()                      # removes the folder ONLY if nothing else remains
+        return True
+    except OSError:
+        eprint(f"[clean] {d}: removed watch-video artifacts; folder kept (contains other files)")
+        return False
+
+
+def do_clean(clean_arg, older_than, base):
+    targets, skipped = [], []
+    if older_than is not None:
+        cutoff = datetime.now(timezone.utc) - timedelta(days=older_than)
+        if base.exists():
+            for d in sorted(p for p in base.iterdir() if p.is_dir()):
+                created = manifest_created(d)
+                if is_watch_video_dir(d) and created is not None and created < cutoff:
+                    targets.append(d)
+                else:
+                    skipped.append(d)
+    elif clean_arg == "all":
+        if base.exists():
+            for d in sorted(p for p in base.iterdir() if p.is_dir()):
+                (targets if is_watch_video_dir(d) else skipped).append(d)
+    elif clean_arg and _looks_like_path(clean_arg):
+        d = Path(clean_arg).expanduser()
+        (targets if is_watch_video_dir(d) else skipped).append(d)
+    elif clean_arg:  # bare token -> slug under base
+        d = base / clean_arg
+        (targets if is_watch_video_dir(d) else skipped).append(d)
+    for d in targets:
+        removed = remove_wv_artifacts(d)
+        eprint(f"[clean] {'deleted' if removed else 'cleaned (folder kept)'} {d}")
+    for d in skipped:
+        eprint(f"[clean] skipped (no valid watch-video manifest) {d}")
+    return targets, skipped
+
+
+def prune_source(video, was_downloaded):
+    """Delete the source video ONLY if watch-video downloaded it. Never deletes a
+    user-provided local input. Returns True if it deleted something."""
+    if not was_downloaded:
+        return False
+    try:
+        Path(video).unlink(missing_ok=True)
+        eprint(f"[no-source] removed downloaded source {video}")
+        return True
+    except Exception as e:
+        eprint(f"[no-source] could not remove source: {e}")
+        return False
+
+
+# ---------------------------------------------------------------------------
+def main():
+    p = argparse.ArgumentParser(prog="watch-video", description="Video → transcript + key frames for an LLM.")
+    p.add_argument("source", nargs="?", help="Loom/any URL, or a local video file")
+    p.add_argument("--diagnose", action="store_true",
+                   help="report dependencies and CUDA visibility, then exit")
+    p.add_argument("--clean", metavar="SLUG|PATH|all",
+                   help="janitorial: delete a watch-video output folder and exit")
+    p.add_argument("--clean-older-than", type=int, metavar="DAYS",
+                   help="janitorial: delete watch-video folders older than DAYS and exit")
+    p.add_argument("--out")
+    p.add_argument("--model", default="auto",
+                   help="Whisper model, or auto = medium on CUDA / small on CPU")
+    p.add_argument("--device", choices=("auto", "cuda", "cpu"), default="auto",
+                   help="Whisper device (default: auto, prefers CUDA when visible)")
+    p.add_argument("--compute-type", default="auto",
+                   help="Whisper compute type (default: float16 on CUDA, int8 on CPU)")
+    p.add_argument("--periodic", type=float, default=4)
+    p.add_argument("--scene-threshold", type=float, default=0.08)
+    p.add_argument("--max-frames", type=int, default=200)
+    p.add_argument("--dedupe-distance", type=int, default=6)
+    p.add_argument("--no-ocr", action="store_true")
+    p.add_argument("--no-contact-sheet", action="store_true")
+    p.add_argument("--no-timeline", action="store_true")
+    p.add_argument("--no-source", action="store_true")
+    p.add_argument("--ocr-tuned", action="store_true")
+    p.add_argument("--force", action="store_true",
+                   help="allow writing into a non-empty directory not created by watch-video")
+    p.add_argument("--cookies-from-browser")
+    p.add_argument("--cookies")
+    p.add_argument("--language")
+    p.add_argument("--caption-language", default="auto",
+                   help="preferred caption language; default uses declared language, then ja/en")
+    p.add_argument("--captions", metavar="VTT|SRT",
+                   help="explicit local caption file to use before Whisper")
+    p.add_argument("--no-captions", action="store_true",
+                   help="skip embedded/sidecar caption discovery and use Whisper")
+    p.add_argument("--captions-only", action="store_true",
+                   help="never fall back to Whisper when no usable caption is available")
+    p.add_argument("--no-transcribe", action="store_true")
+    args = p.parse_args()
+
+    if args.diagnose:
+        diagnose()
+        return
+    if args.captions and args.no_captions:
+        p.error("--captions and --no-captions are mutually exclusive")
+    if args.captions_only and args.no_transcribe:
+        p.error("--captions-only and --no-transcribe are mutually exclusive")
+
+    if args.clean is not None and args.clean_older_than is not None:
+        p.error("--clean and --clean-older-than are mutually exclusive")
+    if args.clean_older_than is not None and args.clean_older_than < 0:
+        p.error("--clean-older-than DAYS must be >= 0")
+    if args.clean is not None or args.clean_older_than is not None:
+        base = Path.cwd() / "watch-video-out"
+        do_clean(args.clean, args.clean_older_than, base)
+        return
+    if not args.source:
+        p.error("source is required unless --clean/--clean-older-than is given")
+
+    if not have("ffmpeg"):
+        sys.exit("ERROR: ffmpeg not found. Install it via scripts/setup.py, or brew/apt/dnf/winget.")
+
+    out_dir = Path(args.out).expanduser() if args.out else Path.cwd() / "watch-video-out" / slugify(args.source)
+    # Determine ownership + emptiness BEFORE we create/write anything, so we never clobber
+    # or later --clean a user's pre-existing directory that we don't own.
+    dir_was_ours = is_watch_video_dir(out_dir)   # validates the manifest signature, not just presence
+    if out_dir.exists() and any(out_dir.iterdir()) and not dir_was_ours and not args.force:
+        sys.exit(
+            f"ERROR: --out '{out_dir}' is a non-empty directory not created by watch-video.\n"
+            "Refusing to write frames/transcript/etc. into it (a later --clean could remove your\n"
+            "files). Choose a new/empty --out, or pass --force to override."
+        )
+    out_dir.mkdir(parents=True, exist_ok=True)
+    frames_dir = out_dir / "frames"
+    eprint(f"[watch-video] output → {out_dir}")
+
+    do_transcribe = not args.no_transcribe
+    do_timeline_planned = not args.no_timeline
+    do_contact_planned = not args.no_contact_sheet
+    frames_dir.mkdir(parents=True, exist_ok=True)
+    reconcile_stale(out_dir, frames_dir, dir_was_ours, do_transcribe,
+                    do_timeline_planned, do_contact_planned)
+
+    info = probe_source(args.source, args.cookies_from_browser, args.cookies)
+    metadata = write_metadata(out_dir, info, args.source)
+    caption = None
+    if do_transcribe and not args.no_captions:
+        caption = find_local_caption(args.source, args.captions, args.caption_language)
+        if caption is None and info and not Path(args.source).expanduser().is_file():
+            caption = download_caption(
+                args.source, out_dir, info, args.caption_language,
+                args.cookies_from_browser, args.cookies,
+            )
+
+    video, was_downloaded = acquire(args.source, out_dir, args.cookies_from_browser, args.cookies)
+    write_manifest(out_dir, args.source, Path(video).name if was_downloaded else None)
+    dur = duration_seconds(video)
+
+    eprint("[frames] extracting (first + scene-change + periodic)…")
+    raw = extract_frames(video, frames_dir, args.periodic, args.scene_threshold)
+    kept = dedupe(raw, args.dedupe_distance, args.max_frames)
+    eprint(f"[frames] {len(raw)} extracted → {len(kept)} kept after dedupe")
+
+    if args.no_transcribe:
+        lang, segments = "skipped", []
+        transcript_source, backend = "none", "none"
+        eprint("[transcribe] skipped (--no-transcribe)")
+    else:
+        caption_segments = write_caption_transcript(out_dir, caption) if caption else None
+        if caption_segments:
+            lang, segments = caption["language"], caption_segments
+            transcript_source = caption["kind"]
+            backend = "caption"
+            eprint(f"[transcribe] using {transcript_source} ({len(segments)} cues); Whisper skipped.")
+        elif args.captions_only:
+            lang, segments = "unavailable", []
+            transcript_source, backend = "none (captions-only)", "none"
+            eprint("[transcribe] no usable captions; Whisper skipped (--captions-only).")
+        else:
+            lang, segments, actual_device, actual_compute, actual_model = transcribe(
+                video, out_dir, args.model, args.language, args.device, args.compute_type
+            )
+            transcript_source = "local-whisper"
+            backend = f"{actual_device}/{actual_compute}, model={actual_model}"
+    n_seg = len(segments)
+
+    do_ocr = (not args.no_ocr) and have("tesseract")
+    if not args.no_ocr and not have("tesseract"):
+        eprint("[ocr] tesseract not found — skipping OCR (install via scripts/setup.py, or brew/apt/dnf/winget).")
+    ocr_map = {}
+    if do_ocr:
+        eprint(f"[ocr] reading on-screen text from {len(kept)} frames…")
+        ocr_map = ocr_frames(kept, frames_dir, tuned=args.ocr_tuned)
+
+    sheet = None
+    if not args.no_contact_sheet:
+        sheet = contact_sheet(kept, out_dir / "contact-sheet.jpg")
+
+    do_timeline = not args.no_timeline
+    if do_timeline:
+        write_timeline(out_dir, kept, segments, ocr_map)
+
+    # SUMMARY.md — the entry point an agent reads first
+    lines = [
+        f"# watch-video result — {slugify(args.source)}",
+        "",
+        f"- **Source:** `{args.source}`",
+        f"- **Platform / extractor:** `{metadata.get('extractor', 'unknown')}`",
+        f"- **Title:** {metadata.get('title', 'unknown')}",
+        f"- **Duration:** {hms(dur)}",
+        f"- **Frames kept:** {len(kept)} (deduped from {len(raw)})",
+        f"- **Transcript:** {n_seg} segments, language `{lang}`, source `{transcript_source}`",
+        f"- **Transcription backend:** `{backend}`",
+        f"- **OCR:** {'yes → frames/ocr-combined.md' if do_ocr else 'no'}",
+        f"- **Contact sheet:** {'contact-sheet.jpg' if sheet else 'none'}",
+        f"- **Timeline:** {'yes → timeline.md' if do_timeline else 'no'}",
+        "",
+        "## How to read this (for an LLM/agent)",
+        "0. Read this SUMMARY, then read the files it lists below (skip any not present).",
+        "1. `metadata.md` contains title/post text/uploader/date/chapters from the source platform.",
+        "2. `timeline.md` interleaves each frame with what was said + on-screen text — read this first.",
+        "3. `transcript.md` for the full timestamped transcript and its provenance.",
+        "4. Open individual `frames/*.jpg`; cross-check exact numbers against `frames/ocr-combined.md`"
+        " (OCR can misread; the image is ground truth).",
+        "",
+        "> ⚠️ This folder may contain private/financial client data — do not commit it.",
+        "",
+        "## Frames",
+    ]
+    for path, t in kept:
+        lines.append(f"- `frames/{path.name}` @ {hms(t)}")
+    (out_dir / "SUMMARY.md").write_text("\n".join(lines) + "\n")
+
+    if args.no_source:
+        prune_source(video, was_downloaded)
+
+    eprint(f"\n[done] {out_dir}/SUMMARY.md")
+    print(str(out_dir / "SUMMARY.md"))
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,21 @@
+{
+  "name": "agedori-video-tools",
+  "interface": {
+    "displayName": "Agedori Video Tools"
+  },
+  "plugins": [
+    {
+      "name": "watch-video",
+      "source": {
+        "source": "url",
+        "url": "https://github.com/Agedori1811/watch-video-codex.git",
+        "ref": "main"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}

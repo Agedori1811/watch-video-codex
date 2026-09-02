@@ -1,0 +1,27 @@
+{
+  "name": "watch-video",
+  "version": "1.2.0",
+  "description": "Caption-first video inspection with source metadata, key frames, OCR, and CUDA-aware Whisper fallback.",
+  "author": {
+    "name": "WebDevBar / Agedori1811"
+  },
+  "homepage": "https://github.com/Agedori1811/watch-video-codex",
+  "repository": "https://github.com/Agedori1811/watch-video-codex",
+  "license": "MIT",
+  "keywords": ["video", "youtube", "captions", "whisper", "cuda", "ocr", "social-media"],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Watch Video",
+    "shortDescription": "動画URLを字幕・重要場面・OCR付きで精密解析します。",
+    "longDescription": "YouTube、X、TikTok、Instagramなどの動画を、Caption-first、CUDA自動選択、投稿メタ情報、重要フレーム、OCRでCodexが確認できる資料に変換します。",
+    "developerName": "Agedori1811",
+    "category": "Productivity",
+    "capabilities": [
+      "YouTube・SNS動画の解析",
+      "字幕優先の文字起こし",
+      "CUDA対応Whisper",
+      "重要フレームとOCR"
+    ],
+    "defaultPrompt": "この動画をwatch-videoで中身まで確認し、発言・映像・画面内文字をタイムスタンプ付きで整理してください。"
+  }
+}

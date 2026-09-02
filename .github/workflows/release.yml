@@ -1,0 +1,22 @@
+name: release
+on:
+  push:
+    # `claude plugin tag` creates `<name>--v<version>`; also accept plain `v*`.
+    tags: ["*--v*", "v*"]
+# The repo default for GITHUB_TOKEN is read-only, so the release step got a bare 403
+# ("Resource not accessible by integration") and NO release has ever been produced -
+# v1.1.1 was tagged and silently published nothing. Ask for write here explicitly.
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build skill bundle
+        run: bash scripts/build-skill.sh dist/watch.skill
+      - name: Attach bundle to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/watch.skill
