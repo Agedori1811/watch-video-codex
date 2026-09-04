@@ -42,18 +42,52 @@ frames/*.jpg, frames/ocr/*.txt (if OCR), contact-sheet.jpg.
 
 import argparse
 import html
+import json
 import os
+import platform
 import re
 import shutil
 import subprocess
 import sys
+import tempfile
+import traceback
+from datetime import datetime, timedelta, timezone
 from functools import lru_cache
-from datetime import datetime
 from pathlib import Path
-import json
-from datetime import datetime, timezone, timedelta
+from urllib.parse import urlsplit, urlunsplit
 
-WATCH_VIDEO_VERSION = "1.2.0"
+WATCH_VIDEO_VERSION = "1.2.1"
+
+
+def safe_source(value):
+    """Return a source identifier safe to persist or print.
+
+    Remote URLs may contain signed query strings, access tokens, fragments, or HTTP
+    userinfo. The raw value is still passed to yt-dlp, but it is never written to
+    logs or output artifacts.
+    """
+    text = str(value)
+    try:
+        parts = urlsplit(text)
+    except ValueError:
+        return text
+    if parts.scheme not in ("http", "https") or not parts.netloc:
+        return text
+    host = parts.hostname or ""
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    try:
+        port = f":{parts.port}" if parts.port else ""
+    except ValueError:
+        port = ""
+    query = "redacted" if parts.query else ""
+    return urlunsplit((parts.scheme, f"{host}{port}", parts.path, query, ""))
+
+
+def safe_error_message(exc):
+    """Keep failures useful without echoing credentials embedded in URLs."""
+    message = str(exc).strip() or type(exc).__name__
+    return re.sub(r"https?://[^\s'\"<>]+", lambda m: safe_source(m.group(0)), message)
 
 
 def write_manifest(out_dir, source, downloaded_name=None):
@@ -65,7 +99,7 @@ def write_manifest(out_dir, source, downloaded_name=None):
     created = None
     if mf.is_file():
         try:
-            old = json.loads(mf.read_text())
+            old = json.loads(mf.read_text(encoding="utf-8"))
             if old.get("tool") == "watch-video":
                 created = old.get("created")
         except Exception:
@@ -73,11 +107,11 @@ def write_manifest(out_dir, source, downloaded_name=None):
     manifest = {
         "tool": "watch-video",
         "version": WATCH_VIDEO_VERSION,
-        "source": str(source),
+        "source": safe_source(source),
         "downloaded_source": downloaded_name,
         "created": created or datetime.now(timezone.utc).isoformat(),
     }
-    mf.write_text(json.dumps(manifest, indent=2) + "\n")
+    mf.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
 
 
 def is_watch_video_dir(path):
@@ -87,7 +121,7 @@ def is_watch_video_dir(path):
     if not mf.is_file():
         return False
     try:
-        return json.loads(mf.read_text()).get("tool") == "watch-video"
+        return json.loads(mf.read_text(encoding="utf-8")).get("tool") == "watch-video"
     except Exception:
         return False
 
@@ -96,8 +130,23 @@ def eprint(*a):
     print(*a, file=sys.stderr, flush=True)
 
 
-def run(cmd, **kw):
-    return subprocess.run(cmd, check=True, **kw)
+class WatchVideoError(RuntimeError):
+    """Expected operational failure that should be shown without a traceback."""
+
+
+def run(cmd, label="external command"):
+    """Run a network-facing command without streaming credential-bearing URLs."""
+    try:
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True, encoding="utf-8", errors="replace"
+        )
+    except OSError as exc:
+        raise WatchVideoError(f"{label} could not start: {safe_error_message(exc)}") from exc
+    if proc.returncode:
+        lines = (proc.stderr or proc.stdout or "").strip().splitlines()
+        detail = safe_error_message(lines[-1]) if lines else "no diagnostic output"
+        raise WatchVideoError(f"{label} failed (exit {proc.returncode}): {detail}")
+    return proc
 
 
 def have(binary):
@@ -147,25 +196,59 @@ def acquire(source, out_dir, cookies_from_browser, cookies_file):
     if not have("yt-dlp"):
         sys.exit("ERROR: yt-dlp not found. Install with: uv tool install yt-dlp")
 
-    target = out_dir / "source.%(ext)s"
-    cmd = [
-        "yt-dlp",
-        "--no-playlist",
-        "-f", "bv*+ba/b",            # best video+audio, merged by ffmpeg
-        "--merge-output-format", "mp4",
-        "-o", str(target),
-    ]
-    if cookies_from_browser:
-        cmd += ["--cookies-from-browser", cookies_from_browser]
-    if cookies_file:
-        cmd += ["--cookies", str(Path(cookies_file).expanduser())]
-    cmd.append(source)
-    eprint(f"[acquire] downloading via yt-dlp: {source}")
-    run(cmd)
-    mp4s = sorted(out_dir.glob("source.*"))
-    if not mp4s:
-        sys.exit("ERROR: yt-dlp produced no file (private link needs --cookies-from-browser?).")
-    return mp4s[0], True
+    # Download in a private temporary directory. This prevents failed/partial downloads
+    # from poisoning a retry and avoids overwriting a user's source.mp4 under --force.
+    with tempfile.TemporaryDirectory(prefix=".watch-video-download-", dir=out_dir) as tmp:
+        tmp_dir = Path(tmp)
+        target = tmp_dir / "download.%(ext)s"
+        cmd = [
+            "yt-dlp",
+            "--no-playlist",
+            "-f", "bv*+ba/b",            # best video+audio, merged by ffmpeg
+            "--merge-output-format", "mp4",
+            "-o", str(target),
+        ]
+        if cookies_from_browser:
+            cmd += ["--cookies-from-browser", cookies_from_browser]
+        if cookies_file:
+            cmd += ["--cookies", str(Path(cookies_file).expanduser())]
+        cmd.append(source)
+        eprint(f"[acquire] downloading via yt-dlp: {safe_source(source)}")
+        run(cmd, "yt-dlp media download")
+        downloads = sorted(path for path in tmp_dir.glob("download.*") if path.is_file())
+        if not downloads:
+            raise WatchVideoError(
+                "yt-dlp produced no media file (a private link may need "
+                "--cookies-from-browser)"
+            )
+        downloaded = downloads[0]
+        previous = None
+        try:
+            manifest = json.loads(
+                (out_dir / ".watch-video.json").read_text(encoding="utf-8")
+            )
+            previous_name = manifest.get("downloaded_source")
+            if manifest.get("tool") == "watch-video" and previous_name:
+                previous = out_dir / Path(previous_name).name
+        except Exception:
+            previous = None
+        preferred = out_dir / f"source{downloaded.suffix.lower()}"
+        if previous and previous.suffix.lower() == downloaded.suffix.lower():
+            destination = previous
+        else:
+            destination = preferred
+            counter = 1
+            while destination.exists():
+                destination = out_dir / (
+                    f"source-watch-video-{counter}{downloaded.suffix.lower()}"
+                )
+                counter += 1
+        if previous == destination:
+            destination.unlink(missing_ok=True)
+        shutil.move(str(downloaded), str(destination))
+        if previous and previous != destination:
+            previous.unlink(missing_ok=True)
+        return destination, True
 
 
 def _auth_args(cookies_from_browser, cookies_file):
@@ -207,11 +290,14 @@ def probe_source(source, cookies_from_browser=None, cookies_file=None):
     cmd = ["yt-dlp", "--no-playlist", "--skip-download", "--dump-single-json"]
     cmd += _auth_args(cookies_from_browser, cookies_file)
     cmd.append(source)
-    eprint(f"[metadata] probing source via yt-dlp: {source}")
-    proc = subprocess.run(cmd, capture_output=True, text=True)
+    eprint(f"[metadata] probing source via yt-dlp: {safe_source(source)}")
+    proc = subprocess.run(
+        cmd, capture_output=True, text=True, encoding="utf-8", errors="replace"
+    )
     if proc.returncode != 0:
         tail = (proc.stderr or "").strip().splitlines()
-        eprint(f"[metadata] WARNING: probe failed: {tail[-1] if tail else 'unknown error'}")
+        detail = safe_error_message(tail[-1]) if tail else "unknown error"
+        eprint(f"[metadata] WARNING: probe failed: {detail}")
         return {}
     try:
         return json.loads(proc.stdout)
@@ -232,7 +318,10 @@ METADATA_KEYS = (
 def write_metadata(out_dir, info, source):
     """Write sanitized SNS/video context for the agent; never persist raw extractor JSON."""
     clean = {k: info.get(k) for k in METADATA_KEYS if info.get(k) is not None}
-    clean["source_input"] = str(source)
+    for key in ("webpage_url", "original_url"):
+        if key in clean:
+            clean[key] = safe_source(clean[key])
+    clean["source_input"] = safe_source(source)
     (out_dir / "metadata.json").write_text(
         json.dumps(clean, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
     )
@@ -302,11 +391,18 @@ def download_caption(source, out_dir, info, preferred_language, cookies_from_bro
     cmd += _auth_args(cookies_from_browser, cookies_file)
     cmd.append(source)
     eprint(f"[captions] trying {kind} language '{language}' before Whisper…")
-    proc = subprocess.run(cmd)
+    proc = subprocess.run(
+        cmd, capture_output=True, text=True, encoding="utf-8", errors="replace"
+    )
     candidates = sorted(captions_dir.glob("source*.vtt"))
     if proc.returncode == 0 and candidates:
         return {"path": candidates[0], "kind": kind, "language": language}
-    eprint("[captions] selected caption could not be downloaded; Whisper will be used if enabled.")
+    tail = (proc.stderr or proc.stdout or "").strip().splitlines()
+    detail = f" ({safe_error_message(tail[-1])})" if tail else ""
+    eprint(
+        "[captions] selected caption could not be downloaded; "
+        f"Whisper will be used if enabled.{detail}"
+    )
     return None
 
 
@@ -445,15 +541,25 @@ def extract_frames(video, frames_dir, periodic, scene_threshold):
         "showinfo"
     )
     info_log = frames_dir / "_showinfo.txt"
-    with open(info_log, "w") as log:
-        subprocess.run(
-            ["ffmpeg", "-hide_banner", "-loglevel", "info", "-i", str(video),
-             "-vf", select, *fps_mode_args(), "-q:v", "2",
-             str(frames_dir / "%06d.jpg")],
-            check=True, stderr=log,
-        )
+    with open(info_log, "w", encoding="utf-8") as log:
+        try:
+            subprocess.run(
+                ["ffmpeg", "-hide_banner", "-loglevel", "info", "-i", str(video),
+                 "-vf", select, *fps_mode_args(), "-q:v", "2",
+                 str(frames_dir / "%06d.jpg")],
+                check=True, stderr=log,
+            )
+        except subprocess.CalledProcessError as exc:
+            log.flush()
+            tail = info_log.read_text(encoding="utf-8", errors="replace").splitlines()
+            detail = safe_error_message(tail[-1]) if tail else "no ffmpeg diagnostic output"
+            raise WatchVideoError(
+                f"frame extraction failed (ffmpeg exit {exc.returncode}): {detail}"
+            ) from exc
     # map each emitted frame (in order) to its pts_time from showinfo
-    times = [float(m) for m in re.findall(r"pts_time:([0-9.]+)", info_log.read_text())]
+    times = [float(m) for m in re.findall(
+        r"pts_time:([0-9.]+)", info_log.read_text(encoding="utf-8", errors="replace")
+    )]
     info_log.unlink(missing_ok=True)
     frames = sorted(frames_dir.glob("[0-9]*.jpg"))
     if len(times) != len(frames):
@@ -537,15 +643,31 @@ def transcribe(video, out_dir, model_name, language, device="auto", compute_type
         raw_segments = list(segment_iter)  # CUDA/runtime failures can surface lazily here.
     except Exception as exc:
         if requested == "auto" and actual_device == "cuda":
-            eprint(f"[transcribe] WARNING: CUDA failed ({exc}); retrying on CPU/int8.")
+            eprint(
+                f"[transcribe] WARNING: CUDA failed ({safe_error_message(exc)}); "
+                "retrying on CPU/int8."
+            )
             actual_device, actual_compute = "cpu", "int8"
             if requested_model == "auto":
                 actual_model = "small"
-            model = WhisperModel(actual_model, device=actual_device, compute_type=actual_compute)
-            segment_iter, info = model.transcribe(str(video), language=language, vad_filter=True)
-            raw_segments = list(segment_iter)
+            try:
+                model = WhisperModel(
+                    actual_model, device=actual_device, compute_type=actual_compute
+                )
+                segment_iter, info = model.transcribe(
+                    str(video), language=language, vad_filter=True
+                )
+                raw_segments = list(segment_iter)
+            except Exception as fallback_exc:
+                raise WatchVideoError(
+                    "transcription failed after CUDA-to-CPU fallback: "
+                    f"{safe_error_message(fallback_exc)}"
+                ) from fallback_exc
         else:
-            raise
+            raise WatchVideoError(
+                f"transcription failed on {actual_device}/{actual_compute}: "
+                f"{safe_error_message(exc)}"
+            ) from exc
     md, txt, segments_out = [], [], []
     for seg in raw_segments:
         stamp = hms(seg.start)
@@ -554,16 +676,19 @@ def transcribe(video, out_dir, model_name, language, device="auto", compute_type
         txt.append(line)
         segments_out.append((seg.start, line))
     (out_dir / "transcript.md").write_text(
-        f"# Transcript ({actual_model}, lang={info.language})\n\n" + "\n".join(md) + "\n"
+        f"# Transcript ({actual_model}, lang={info.language})\n\n" + "\n".join(md) + "\n",
+        encoding="utf-8",
     )
-    (out_dir / "transcript.txt").write_text("\n".join(txt) + "\n")
+    (out_dir / "transcript.txt").write_text("\n".join(txt) + "\n", encoding="utf-8")
     return info.language, segments_out, actual_device, actual_compute, actual_model
 
 
 def diagnose():
     """Print a concise local readiness report without downloading a video or model."""
     print(f"watch-video {WATCH_VIDEO_VERSION}")
-    for binary in ("ffmpeg", "ffprobe", "yt-dlp", "tesseract"):
+    print(f"python: {platform.python_version()}")
+    print(f"platform: {platform.system()} {platform.machine()}")
+    for binary in ("uv", "ffmpeg", "ffprobe", "yt-dlp", "tesseract"):
         print(f"{binary}: {'present' if have(binary) else 'missing'}")
     js_runtime = next((name for name in ("deno", "node", "bun", "qjs") if have(name)), None)
     print(f"javascript_runtime: {js_runtime or 'missing (recommended for full YouTube support)'}")
@@ -610,10 +735,12 @@ def ocr_frames(frames, frames_dir, tuned=False):
         else:
             text = pytesseract.image_to_string(im).strip()
         ocr_map[path] = text
-        (ocr_dir / (path.stem + ".txt")).write_text(text)
+        (ocr_dir / (path.stem + ".txt")).write_text(text, encoding="utf-8")
         if text:
             combined.append(f"### {path.name} (@ {hms(t)})\n{text}\n")
-    (frames_dir / "ocr-combined.md").write_text("\n".join(combined) + "\n")
+    (frames_dir / "ocr-combined.md").write_text(
+        "\n".join(combined) + "\n", encoding="utf-8"
+    )
     return ocr_map
 
 
@@ -658,7 +785,7 @@ def write_timeline(out_dir, kept, segments, ocr_map):
         if snippet:
             lines.append(f"OCR: {snippet}")
         lines.append("")
-    (out_dir / "timeline.md").write_text("\n".join(lines) + "\n")
+    (out_dir / "timeline.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def reconcile_stale(out_dir, frames_dir, dir_was_ours, do_transcribe, do_timeline, do_contact):
@@ -698,7 +825,7 @@ def reconcile_stale(out_dir, frames_dir, dir_was_ours, do_transcribe, do_timelin
 
 def manifest_created(path):
     try:
-        data = json.loads((Path(path) / ".watch-video.json").read_text())
+        data = json.loads((Path(path) / ".watch-video.json").read_text(encoding="utf-8"))
         return datetime.fromisoformat(data["created"])
     except Exception:
         return None
@@ -706,6 +833,37 @@ def manifest_created(path):
 
 def _looks_like_path(arg):
     return ("/" in arg) or ("\\" in arg) or Path(arg).is_absolute()
+
+
+VIDEO_SUFFIXES = {
+    ".avi", ".flv", ".m4v", ".mkv", ".mov", ".mp4",
+    ".mpeg", ".mpg", ".webm", ".wmv",
+}
+
+
+def validate_processing_args(parser, args):
+    """Reject invalid inputs before starting expensive or destructive work."""
+    if args.periodic <= 0:
+        parser.error("--periodic SECONDS must be > 0")
+    if not 0 <= args.scene_threshold <= 1:
+        parser.error("--scene-threshold must be between 0 and 1")
+    if args.max_frames < 1:
+        parser.error("--max-frames must be >= 1")
+    if args.dedupe_distance < 0:
+        parser.error("--dedupe-distance must be >= 0")
+    if args.cookies and not Path(args.cookies).expanduser().is_file():
+        parser.error("--cookies FILE does not exist or is not a file")
+    source_path = Path(args.source).expanduser()
+    try:
+        parsed = urlsplit(args.source)
+        is_remote = parsed.scheme in ("http", "https") and bool(parsed.netloc)
+    except ValueError:
+        is_remote = False
+    looks_local = not is_remote and (
+        _looks_like_path(args.source) or source_path.suffix.lower() in VIDEO_SUFFIXES
+    )
+    if looks_local and not source_path.is_file():
+        parser.error(f"local source file not found: {args.source}")
 
 
 # The exact set of files/dirs watch-video creates in an output folder.
@@ -720,7 +878,7 @@ def remove_wv_artifacts(d):
     d = Path(d)
     downloaded = None
     try:
-        m = json.loads((d / ".watch-video.json").read_text())
+        m = json.loads((d / ".watch-video.json").read_text(encoding="utf-8"))
         if m.get("tool") == "watch-video":
             downloaded = m.get("downloaded_source")
     except Exception:
@@ -870,9 +1028,15 @@ def main():
         return
     if not args.source:
         p.error("source is required unless --clean/--clean-older-than is given")
+    validate_processing_args(p, args)
 
-    if not have("ffmpeg"):
-        sys.exit("ERROR: ffmpeg not found. Install it via scripts/setup.py, or brew/apt/dnf/winget.")
+    missing_media_tools = [name for name in ("ffmpeg", "ffprobe") if not have(name)]
+    if missing_media_tools:
+        sys.exit(
+            "ERROR: required media tool(s) missing: "
+            f"{', '.join(missing_media_tools)}. Install ffmpeg via scripts/setup.py, "
+            "or brew/apt/dnf/winget."
+        )
 
     out_dir = Path(args.out).expanduser() if args.out else Path.cwd() / "watch-video-out" / slugify(args.source)
     # Determine ownership + emptiness BEFORE we create/write anything, so we never clobber
@@ -884,7 +1048,20 @@ def main():
             "Refusing to write frames/transcript/etc. into it (a later --clean could remove your\n"
             "files). Choose a new/empty --out, or pass --force to override."
         )
+    previous_downloaded = None
+    if dir_was_ours:
+        try:
+            previous_downloaded = json.loads(
+                (out_dir / ".watch-video.json").read_text(encoding="utf-8")
+            ).get("downloaded_source")
+        except Exception:
+            previous_downloaded = None
     out_dir.mkdir(parents=True, exist_ok=True)
+    # Claim a newly validated empty directory before network work. Existing owned dirs
+    # retain their prior download marker until acquisition succeeds, which makes retries
+    # and replacement of a prior tool-owned source safe.
+    if not dir_was_ours:
+        write_manifest(out_dir, args.source)
     frames_dir = out_dir / "frames"
     eprint(f"[watch-video] output → {out_dir}")
 
@@ -907,6 +1084,14 @@ def main():
             )
 
     video, was_downloaded = acquire(args.source, out_dir, args.cookies_from_browser, args.cookies)
+    if not was_downloaded and previous_downloaded:
+        old_source = out_dir / Path(previous_downloaded).name
+        try:
+            same_as_input = old_source.resolve() == Path(video).resolve()
+        except OSError:
+            same_as_input = False
+        if not same_as_input:
+            old_source.unlink(missing_ok=True)
     write_manifest(out_dir, args.source, Path(video).name if was_downloaded else None)
     dur = duration_seconds(video)
 
@@ -944,7 +1129,11 @@ def main():
     ocr_map = {}
     if do_ocr:
         eprint(f"[ocr] reading on-screen text from {len(kept)} frames…")
-        ocr_map = ocr_frames(kept, frames_dir, tuned=args.ocr_tuned)
+        try:
+            ocr_map = ocr_frames(kept, frames_dir, tuned=args.ocr_tuned)
+        except Exception as exc:
+            do_ocr = False
+            eprint(f"[ocr] WARNING: OCR failed and was skipped: {safe_error_message(exc)}")
 
     sheet = None
     if not args.no_contact_sheet:
@@ -958,7 +1147,7 @@ def main():
     lines = [
         f"# watch-video result — {slugify(args.source)}",
         "",
-        f"- **Source:** `{args.source}`",
+        f"- **Source:** `{safe_source(args.source)}`",
         f"- **Platform / extractor:** `{metadata.get('extractor', 'unknown')}`",
         f"- **Title:** {metadata.get('title', 'unknown')}",
         f"- **Duration:** {hms(dur)}",
@@ -983,7 +1172,7 @@ def main():
     ]
     for path, t in kept:
         lines.append(f"- `frames/{path.name}` @ {hms(t)}")
-    (out_dir / "SUMMARY.md").write_text("\n".join(lines) + "\n")
+    (out_dir / "SUMMARY.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
     if args.no_source:
         prune_source(video, was_downloaded)
@@ -992,5 +1181,29 @@ def main():
     print(str(out_dir / "SUMMARY.md"))
 
 
+def cli_entrypoint():
+    try:
+        main()
+    except KeyboardInterrupt:
+        eprint("ERROR: cancelled by user")
+        raise SystemExit(130)
+    except WatchVideoError as exc:
+        eprint(f"ERROR: {safe_error_message(exc)}")
+        raise SystemExit(1)
+    except subprocess.CalledProcessError as exc:
+        command = Path(str(exc.cmd[0] if isinstance(exc.cmd, (list, tuple)) else exc.cmd)).name
+        eprint(f"ERROR: {command or 'external command'} failed (exit {exc.returncode})")
+        raise SystemExit(exc.returncode or 1)
+    except Exception as exc:
+        if os.environ.get("WATCH_VIDEO_DEBUG") == "1":
+            traceback.print_exc()
+        else:
+            eprint(
+                f"ERROR: unexpected {type(exc).__name__}: {safe_error_message(exc)} "
+                "(set WATCH_VIDEO_DEBUG=1 for a traceback)"
+            )
+        raise SystemExit(1)
+
+
 if __name__ == "__main__":
-    main()
+    cli_entrypoint()

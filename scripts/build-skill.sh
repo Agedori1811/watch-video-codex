@@ -14,6 +14,7 @@ OUT="$(cd "$(dirname "$OUT")" && pwd)/$(basename "$OUT")"
 test -f "$HERE/watch-video" || { echo "ERROR: watch-video CLI not found at repo root" >&2; exit 1; }
 
 cp "$HERE/watch-video" "$STAGE/"
+cp "$HERE/watch-video.lock" "$STAGE/"
 cp "$HERE/SKILL.md" "$STAGE/"
 mkdir -p "$STAGE/commands" "$STAGE/scripts" "$STAGE/.claude-plugin" "$STAGE/.codex-plugin"
 cp "$HERE/commands/watch.md" "$STAGE/commands/"

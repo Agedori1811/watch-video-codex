@@ -24,7 +24,9 @@ agent runs it for you and reads the result).
 > **Everything runs locally** — `yt-dlp` + `ffmpeg` + `faster-whisper` + `tesseract`.
 > No video or audio is sent to any cloud service. This is the whole point: recordings
 > often contain private or financial data.
-> Version: **1.2.0** · License: MIT
+> Version: **1.2.1** · License: MIT
+
+[![CI](https://github.com/Agedori1811/watch-video-codex/actions/workflows/ci.yml/badge.svg)](https://github.com/Agedori1811/watch-video-codex/actions/workflows/ci.yml)
 
 ---
 
@@ -82,13 +84,15 @@ use a local Windows host when you want to use the PC's NVIDIA GPU.
 
 | Tool | Required? | Purpose | Install |
 |---|---|---|---|
-| [`uv`](https://docs.astral.sh/uv/) | ✅ | runs the single-file script + its inline deps | `curl -LsSf https://astral.sh/uv/install.sh \| sh` |
-| `ffmpeg` | ✅ | frame extraction | `brew install ffmpeg` / `apt install ffmpeg` / `dnf install ffmpeg` |
+| [`uv`](https://docs.astral.sh/uv/) | ✅ | runs the single-file script + its locked inline deps | `curl -LsSf https://astral.sh/uv/install.sh \| sh` |
+| `ffmpeg` + `ffprobe` | ✅ | frame extraction and duration probing | `brew install ffmpeg` / `apt install ffmpeg` / `dnf install ffmpeg` |
 | `tesseract` | optional | OCR of on-screen text | `brew install tesseract` / `apt install tesseract-ocr` / `dnf install tesseract` |
 
 `yt-dlp` (including its default JavaScript challenge components and browser impersonation
 extra), `faster-whisper`, `Pillow`, `numpy`, and `pytesseract` are pulled automatically by
-`uv` on first run (Python 3.10+). Or run the bootstrap:
+`uv` on first run (Python 3.10+). Their complete transitive resolution and hashes are
+committed in `watch-video.lock`; `uv run --locked --script watch-video …` refuses to
+silently re-resolve it. Or run the bootstrap:
 
 ```bash
 python3 scripts/setup.py        # installs uv + ffmpeg (required) and tesseract (optional)
@@ -106,7 +110,7 @@ choice; this fork also detects an installed Node.js/Bun/QuickJS runtime automati
 |---|---|---|
 | **Linux** | ✅ Supported | Primary dev/test platform. |
 | **macOS** | ✅ Supported | `setup.py` uses Homebrew; all deps available. All paths are POSIX. |
-| **Windows** (incl. Claude CLI in PowerShell) | ✅ Supported — local-file path verified on Windows 11 | The plugin invokes the tool through **`uv run`** (the one required dep), so it does **not** depend on a `python3` on PATH, and all paths use `pathlib`. `uv`, `ffmpeg`, `tesseract`, `yt-dlp`, and `faster-whisper` all have Windows builds (`setup.py` uses `winget`). Two caveats: (1) run the bare CLI as `uv run --script watch-video …` — the `./watch-video` shebang form is POSIX-only; (2) the **dev** scripts `tests/*.sh` and `scripts/build-skill.sh` are Bash, so they need **Git Bash or WSL** (end users don't run these). |
+| **Windows** (incl. Claude CLI in PowerShell) | ✅ Supported — local-file path verified on Windows 11 | The plugin invokes the tool through **`uv run`** (the one required dep), so it does **not** depend on a `python3` on PATH, and all paths use `pathlib`. `uv`, `ffmpeg`, `tesseract`, `yt-dlp`, and `faster-whisper` all have Windows builds (`setup.py` uses `winget`). Two caveats: (1) run the bare CLI as `uv run --locked --script watch-video …` — the `./watch-video` shebang form is POSIX-only; (2) the **dev** scripts `tests/*.sh` and `scripts/build-skill.sh` are Bash, so they need **Git Bash or WSL** (end users don't run these). |
 
 > **Windows base status (upstream 1.1.3).** Verified on Windows 11 with ffmpeg 9.0.1, uv 0.12.7 and
 > tesseract 5.5.3, on **both** paths: a local file, and a YouTube URL through `yt-dlp`
@@ -164,7 +168,7 @@ The shebang is `#!/usr/bin/env -S uv run --script`, so `uv` handles the environm
 **On Windows** (PowerShell/cmd) the shebang doesn't apply — run it explicitly:
 
 ```powershell
-uv run --script watch-video <loom-url | any-url | local-file.mp4> [options]
+uv run --locked --script watch-video <loom-url | any-url | local-file.mp4> [options]
 ```
 
 ### E. claude.ai web bundle (non-sensitive videos only)
@@ -298,6 +302,9 @@ the agent runs the tool, reads the artifacts into context, then runs
 - **Output is sensitive.** Folders may contain private/financial data; they're
   `.gitignore`d — never commit one. For private Loom links, cookies are read locally;
   never copy them into output/transcripts.
+- **Credential-bearing URLs are redacted.** Query strings, fragments, and HTTP userinfo
+  are removed from logs, manifests, metadata, and summaries. The original URL is only
+  passed in-memory to `yt-dlp`.
 
 ---
 
@@ -330,14 +337,19 @@ A step-by-step user guide lives in [`docs/USER-GUIDE.md`](docs/USER-GUIDE.md).
 ## Development
 
 ```bash
-bash tests/run_all.sh                 # full suite (offline; tesseract optional)
+python -m unittest discover -s tests -p 'test_*.py' -v  # portable unit suite
+python tests/integration_smoke.py     # locked uv + ffmpeg local-file smoke test
+bash tests/run_all.sh                 # existing Linux/POSIX regression suite
 WV_TRANSCRIBE_TEST=1 bash tests/transcribe_test.sh   # opt-in: exercises real Whisper
+python scripts/check_release.py       # version, lock, and bundle-source invariants
 bash scripts/build-skill.sh dist/watch.skill         # build the distributable bundle
 ```
 
-Tests are offline bash integration + unit tests against a synthetic clip (no network once
-the `uv` cache is warm; `--no-transcribe` avoids the model download). The CLI is a single
-file (`watch-video`); the wrapper/bootstrap/builder live in `scripts/`.
+GitHub Actions runs native Ubuntu, Windows, and macOS jobs, plus Python 3.10–3.14
+compatibility checks. The cross-platform job processes a synthetic local clip and a
+Japanese sidecar caption through the locked CLI; the broader Bash regression suite runs
+on Ubuntu. See [`docs/VERIFICATION.md`](docs/VERIFICATION.md) for the exact boundary and
+honest manual checks, and [`docs/RELEASING.md`](docs/RELEASING.md) for releases.
 
 ---
 

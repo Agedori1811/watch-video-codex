@@ -1,7 +1,7 @@
 # Transcription backend — caveats & upgrade paths
 
 v1.2 uses **`faster-whisper` with automatic device selection** after trying captions.
-Run `uv run --script watch-video --diagnose` to see what the process can use.
+Run `uv run --locked --script watch-video --diagnose` to see what the process can use.
 
 - **CPU:** `cpu/int8`; hardware-aware `--model auto` selects `small`.
 - **NVIDIA / CUDA:** `cuda/float16`; `--model auto` selects `medium`. Current

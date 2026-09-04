@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.2.1 — 2026-09-04
+- Added native Ubuntu, Windows, and macOS GitHub Actions CI, Python 3.10–3.14
+  compatibility checks, and a cross-platform locked-dependency integration smoke test.
+- Added `watch-video.lock` with hashes and included it in both Codex skill and release
+  bundles for reproducible `uv run --locked --script` installs.
+- Added portable tests for CLI validation, Caption-first behavior, UTF-8 paths/content,
+  CUDA fallback, wrapper behavior, setup package mapping, and credential redaction.
+- Hardened operational failures: concise non-traceback messages by default, safer
+  external-command logging, numeric/path validation, and optional OCR failure fallback.
+- Fixed Windows `winget` package identifiers/agreements, Linux's tesseract package name,
+  required `ffprobe` checks, and cross-platform UTF-8 file I/O.
+- Documented CI scope, intentionally unverified hardware/auth paths, minimal manual
+  checks, and a version-checked release procedure with SHA-256 bundle checksums.
+
 ## 1.2.0 — 2026-09-02
 - **Caption-first transcription:** authored subtitles, then automatic subtitles, then
   local Whisper. Local `.vtt`/`.srt` sidecars and explicit `--captions` are supported.

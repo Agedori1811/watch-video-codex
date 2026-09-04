@@ -2,6 +2,8 @@
 """Thin wrapper the /watch command calls. Resolves + runs the bundled watch-video
 CLI via `uv run --script`, applies /watch defaults, and prints exactly one stdout
 line: the output directory. Holds no pipeline logic. See spec §9."""
+import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -10,13 +12,34 @@ SKILL_DIR = Path(__file__).resolve().parent.parent  # CLI ships at the bundle ro
 CLI = SKILL_DIR / "watch-video"
 
 
+def command_prefix():
+    uv = shutil.which("uv")
+    if not uv:
+        sys.exit("watch-run: uv not found; run scripts/setup.py or install uv first")
+    if not CLI.is_file():
+        sys.exit(f"watch-run: bundled CLI not found: {CLI}")
+    return [uv, "run", "--locked", "--script", str(CLI)]
+
+
+def child_env():
+    env = os.environ.copy()
+    env.setdefault("PYTHONUTF8", "1")
+    return env
+
+
 def run_cli(extra_args, default_ocr_tuned):
-    cmd = ["uv", "run", "--script", str(CLI)]
+    cmd = command_prefix()
     if default_ocr_tuned and "--no-ocr" not in extra_args and "--ocr-tuned" not in extra_args:
         cmd.append("--ocr-tuned")
     cmd += extra_args
     # CLI prints exactly one stdout line: the SUMMARY.md path. stderr passes through.
-    proc = subprocess.run(cmd, stdout=subprocess.PIPE, text=True)
+    try:
+        proc = subprocess.run(
+            cmd, stdout=subprocess.PIPE, text=True, encoding="utf-8",
+            errors="replace", env=child_env()
+        )
+    except OSError as exc:
+        sys.exit(f"watch-run: could not start uv: {exc}")
     if proc.returncode != 0:
         sys.exit(proc.returncode)
     summary_line = (proc.stdout or "").strip().splitlines()[-1] if proc.stdout.strip() else ""
@@ -27,8 +50,11 @@ def run_cli(extra_args, default_ocr_tuned):
 
 def run_cleanup(clean_args):
     # clean_args is already filtered to ONLY cleanup flags + their values.
-    cmd = ["uv", "run", "--script", str(CLI)] + clean_args
-    sys.exit(subprocess.run(cmd).returncode)
+    cmd = command_prefix() + clean_args
+    try:
+        sys.exit(subprocess.run(cmd, env=child_env()).returncode)
+    except OSError as exc:
+        sys.exit(f"watch-run: could not start uv: {exc}")
 
 
 def _extract_cleanup_args(argv):

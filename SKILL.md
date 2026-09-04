@@ -18,7 +18,7 @@ surface.** Output folders may contain private/financial data — never commit or
 upload them.
 
 ## Dependencies
-Required: `uv`, `ffmpeg`. Optional: `tesseract` (OCR). Run
+Required: `uv`, `ffmpeg` (including `ffprobe`). Optional: `tesseract` (OCR). Run
 `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/setup.py"` once to install them (it attempts the
 official `uv` installer + your OS package manager for ffmpeg; tesseract is best-effort),
 or preinstall manually. On **Windows** use `python` or `py` if `python3` isn't found. If

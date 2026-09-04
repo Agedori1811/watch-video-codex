@@ -6,12 +6,13 @@ as a command-line tool. For the project overview see the [README](../README.md).
 > **Platforms.** Linux and macOS are supported, and the upstream 1.1.3 pipeline was
 > verified on Windows 11. This fork's CUDA path must still be diagnosed on the target PC —
 > see the README's *Platform support* table. On Windows, the CLI examples below that start
-> with `./watch-video …` should be run as `uv run --script watch-video …`, and use
+> with `./watch-video …` should be run as `uv run --locked --script watch-video …`, and use
 > `python`/`py` if `python3` isn't found. The Bash test/build scripts need Git Bash or WSL.
 
 ## 1. Install the dependencies
 
-`watch-video` needs **`uv`** and **`ffmpeg`** (required) and **`tesseract`** (optional,
+`watch-video` needs **`uv`**, **`ffmpeg`**, and **`ffprobe`** (required) and
+**`tesseract`** (optional,
 for OCR). The quickest path:
 
 ```bash
@@ -28,6 +29,10 @@ python3 scripts/setup.py --check
 
 If `uv`'s installer puts it somewhere not yet on your `PATH`, add that directory to
 `PATH` and re-run. To install manually, see the table in the README.
+
+The repository and release bundle include `watch-video.lock`. Use
+`uv run --locked --script watch-video …` for direct CLI calls so dependency versions and
+hashes cannot be silently re-resolved.
 
 ## 2. First run
 
@@ -114,7 +119,7 @@ The default order is authored caption, automatic caption, then local Whisper. Fo
 files, a same-name `.vtt` or `.srt` is used automatically. `--captions FILE` selects one
 explicitly, `--captions-only` forbids Whisper fallback, and `--no-captions` forces it.
 
-Run `uv run --script watch-video --diagnose` first. When CUDA is visible, auto mode uses
+Run `uv run --locked --script watch-video --diagnose` first. When CUDA is visible, auto mode uses
 `cuda/float16` and the `medium` model; otherwise it uses `cpu/int8` and `small`. Use
 `--device cuda` when CUDA is mandatory rather than allowing fallback.
 
@@ -154,6 +159,7 @@ new/empty directory, or pass `--force` if you really mean to write there.
 | Symptom | Cause / fix |
 |---|---|
 | `ERROR: ffmpeg not found` | Install ffmpeg (`python3 scripts/setup.py`). |
+| `required media tool(s) missing: ffprobe` | Reinstall the complete ffmpeg package; ffprobe ships with it. |
 | `yt-dlp produced no file` | The link is private — add `--cookies-from-browser <browser>`. |
 | OCR section empty / no `ocr-combined.md` | `tesseract` isn't installed (OCR is skipped). Install it, or accept transcript+frames only. |
 | First run is slow / needs network | First transcription downloads the Whisper model once, then caches it. Use a smaller `--model` (`base`/`tiny`) to speed up. |
@@ -165,3 +171,6 @@ new/empty directory, or pass `--force` if you really mean to write there.
 NVIDIA CUDA is automatic. Current faster-whisper releases require CUDA 12 cuBLAS and
 cuDNN 9; see [`TRANSCRIPTION-BACKENDS.md`](TRANSCRIPTION-BACKENDS.md). AMD/Apple remain
 CPU-only in this build.
+
+For the exact automated coverage and target-machine checks that remain necessary, see
+[`VERIFICATION.md`](VERIFICATION.md).

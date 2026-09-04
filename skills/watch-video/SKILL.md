@@ -16,7 +16,7 @@ Work environment, only process non-sensitive or public videos. Output folders ma
 contain private or financial data; never commit or upload them.
 
 ## Dependencies
-Required: `uv`, `ffmpeg`. Optional: `tesseract` (OCR). Run
+Required: `uv`, `ffmpeg` (including `ffprobe`). Optional: `tesseract` (OCR). Run
 `python3 <skill-root>/scripts/setup.py` once to install them (it attempts the
 official `uv` installer + your OS package manager for ffmpeg; tesseract is best-effort),
 or preinstall manually. On **Windows** use `python` or `py` if `python3` isn't found. If

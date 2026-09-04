@@ -1,6 +1,6 @@
 {
   "name": "watch-video",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "description": "Caption-first video/SNS inspection with CUDA Whisper, metadata, key frames, and OCR.",
   "author": {
     "name": "webdevbar"

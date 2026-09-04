@@ -8,6 +8,7 @@ bash "$HERE/scripts/build-skill.sh" "$OUT/watch.skill" >/dev/null 2>&1
 test -f "$OUT/watch.skill" || { echo "FAIL: bundle not produced"; exit 1; }
 # bundle MUST contain the CLI
 unzip -l "$OUT/watch.skill" | grep -q "watch-video" || { echo "FAIL: bundle missing watch-video CLI"; exit 1; }
+unzip -l "$OUT/watch.skill" | grep -q "watch-video.lock" || { echo "FAIL: bundle missing dependency lock"; exit 1; }
 unzip -l "$OUT/watch.skill" | grep -q "SKILL.md" || { echo "FAIL: bundle missing SKILL.md"; exit 1; }
 unzip -l "$OUT/watch.skill" | grep -q ".claude-plugin/plugin.json" || { echo "FAIL: bundle missing .claude-plugin manifest"; exit 1; }
 # Also exercise a RELATIVE output path exactly as the release workflow does (catches the
