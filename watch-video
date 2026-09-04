@@ -185,6 +185,9 @@ def fps_mode_args():
 
 
 def slugify(text):
+    # Slugs are written to directory names and SUMMARY headings, so sanitize
+    # credential-bearing URLs before deriving them just like other persisted output.
+    text = safe_source(text)
     text = re.sub(r"^https?://", "", text)
     text = re.sub(r"[^a-zA-Z0-9._-]+", "-", text).strip("-")
     return (text[:60] or "video").lower()

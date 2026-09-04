@@ -31,6 +31,13 @@ class PortableCliTests(unittest.TestCase):
         self.assertNotIn("password", safe)
         self.assertNotIn("secret", safe)
 
+    def test_sensitive_url_slug_is_redacted(self):
+        raw = "https://user:password@example.com:8443/video?id=7&token=secret#fragment"
+        slug = self.ns["slugify"](raw)
+        self.assertEqual(slug, "example.com-8443-video-redacted")
+        self.assertNotIn("password", slug)
+        self.assertNotIn("secret", slug)
+
     def test_stdio_is_reconfigured_for_utf8_when_supported(self):
         class Stream:
             def __init__(self):
