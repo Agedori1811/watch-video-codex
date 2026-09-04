@@ -12,7 +12,7 @@
 - Hardened operational failures: concise non-traceback messages by default, safer
   external-command logging, numeric/path validation, and optional OCR failure fallback.
 - Fixed Windows `winget` package identifiers/agreements, Linux's tesseract package name,
-  required `ffprobe` checks, and cross-platform UTF-8 file I/O.
+  required `ffprobe` checks, and cross-platform UTF-8 file and console I/O.
 - Documented CI scope, intentionally unverified hardware/auth paths, minimal manual
   checks, and a version-checked release procedure with SHA-256 bundle checksums.
 

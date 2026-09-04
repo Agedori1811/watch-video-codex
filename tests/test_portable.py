@@ -31,6 +31,23 @@ class PortableCliTests(unittest.TestCase):
         self.assertNotIn("password", safe)
         self.assertNotIn("secret", safe)
 
+    def test_stdio_is_reconfigured_for_utf8_when_supported(self):
+        class Stream:
+            def __init__(self):
+                self.calls = []
+
+            def reconfigure(self, **kwargs):
+                self.calls.append(kwargs)
+
+        stdout, stderr = Stream(), Stream()
+        with mock.patch.object(self.ns["sys"], "stdout", stdout), mock.patch.object(
+            self.ns["sys"], "stderr", stderr
+        ):
+            self.ns["configure_stdio"]()
+        expected = [{"encoding": "utf-8", "errors": "replace"}]
+        self.assertEqual(stdout.calls, expected)
+        self.assertEqual(stderr.calls, expected)
+
     def test_remote_acquire_does_not_overwrite_user_source_file(self):
         acquire = self.ns["acquire"]
         globals_ = acquire.__globals__
