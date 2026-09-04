@@ -5,6 +5,8 @@
   compatibility checks, and a cross-platform locked-dependency integration smoke test.
 - Added `watch-video.lock` with hashes and included it in both Codex skill and release
   bundles for reproducible `uv run --locked --script` installs.
+- Pinned Python 3.10 to the newest `onnxruntime` release with Linux, Windows, and
+  macOS wheels while preserving current dependency selection on newer Python versions.
 - Added portable tests for CLI validation, Caption-first behavior, UTF-8 paths/content,
   CUDA fallback, wrapper behavior, setup package mapping, and credential redaction.
 - Hardened operational failures: concise non-traceback messages by default, safer

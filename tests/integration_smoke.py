@@ -19,14 +19,18 @@ def require(binary):
 
 
 def call(args):
-    return subprocess.run(
+    result = subprocess.run(
         [require("uv"), "run", "--locked", "--script", str(CLI), *map(str, args)],
-        check=True,
         capture_output=True,
         text=True,
         encoding="utf-8",
         errors="replace",
     )
+    if result.returncode:
+        sys.stderr.write(result.stdout)
+        sys.stderr.write(result.stderr)
+        raise SystemExit(result.returncode)
+    return result
 
 
 def main():

@@ -3,6 +3,7 @@
 # requires-python = ">=3.10"
 # dependencies = [
 #   "faster-whisper>=1.1.0",
+#   "onnxruntime==1.19.2; python_version < '3.11'",
 #   "yt-dlp[default,curl-cffi]>=2026.8.6",
 #   "Pillow>=10.0",
 #   "numpy>=1.24",
